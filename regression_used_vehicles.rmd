@@ -1,0 +1,1890 @@
+---
+title: "Regression Project - Commercial Used Vehicle Sales"
+author: "Jonathan Schierbaum"
+date: "FALL 2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE)
+
+packages <- c("knitr", "dplyr", "ggplot2", 
+              "reshape2", "GGally", "readr", 
+              "sp", "sf", "maps", 
+              "maptools", "stringr", "car", 
+              "leaps", "caret", "plyr", 
+              "lmtest", "texreg")
+
+missing <- packages[!(packages %in% installed.packages())]
+
+if(length(missing) > 0) install.packages(missing)
+
+invisible(suppressMessages(lapply(packages, library, character.only = TRUE)))
+```
+
+## Load Pre-Filtered Data Object For Analysis
+```{r data_subset}
+fp_data_obj <- "~/GitHub/project-regression/data_objs/"
+
+# Per instructor, create dataset for fast analysis
+# Limit sales to California.
+# randomly sample 25,000 records from these.
+
+load(paste0(fp_data_obj, "used_car_data_CA.RData"))
+load(paste0(fp_data_obj, "outliers.RData"))
+
+# All Used Vehicle Sales
+load(paste0(fp_data_obj, "used_car_data.RData"))
+```
+
+## Load Raw Data
+```{r loading_data, eval= FALSE}
+fp_raw_data <- "~/GitHub/project-regression/raw_data/"
+
+# primary dataset
+# NOTE: there is a link for this file on Github
+cars    <- read_csv(paste0(fp_raw_data, "all_vehicle_data.csv"))
+
+# backup row id for raw data
+cars$id <- seq(1, nrow(cars), 1)
+
+# socio-economic dataset
+demos   <- read_csv(paste0(fp_raw_data, "demographics_by_county.csv"))
+
+head(cars)
+colnames(cars)
+```
+
+## Ad-Hoc Functions
+```{r functions}
+#need a way of visualizing relationships of many variables simultaneously
+
+plot_pairs_cont <- function(dat, yvar, colnums = 2:15, title = "") {
+ 
+    # loop through columns to graph scatterplots
+    for (i in colnums) {
+        
+        plot(dat[,i], dat[, yvar], 
+             xlab = names(dat)[i], ylab = yvar, 
+             main = title)
+        
+        # add lowess line for non-factor/non-character variables
+        if (!(class(dat[,i]) %in% c('factor', 'character'))) {
+            lines(lowess(dat[,i], dat[, yvar]), col = "red")
+        }
+        
+    }  # end loop
+}  # end function
+
+plot_pairs_cat <- function(dat, yvar, colnums = 16:23) {
+ 
+    # loop through columns to graph scatterplots
+    for (i in 16:23) {
+        
+        plot(dat[,i], dat[, yvar], 
+             xlab = names(dat)[i], ylab = yvar, 
+             cex.lab = 2, cex.axis = 2)
+        
+        # add lowess line for non-factor/non-character variables
+        if (!(class(dat[,i]) %in% c('factor', 'character'))) {
+            lines(lowess(dat[,i], dat[, yvar]), col = "red")
+        }
+        
+    }  # end loop
+}  # end function
+
+plot_best_model <- function(number_variables, crit, func) {
+    
+    # plot criteria vs number of variables
+    plot(number_variables, model_summ[[crit]], 
+         xlab = "Number of Variables", ylab = crit,
+         main = "Variable Selection",
+         cex.lab = 1)
+    
+    # plot line for visualization
+    lines(unique(number_variables), tapply(model_summ[[crit]], number_variables, match.fun(func)))
+    
+}
+```
+
+
+## Data cleaning & coding
+
+### Filter rows
+```{r filter_records, eval= FALSE}
+
+# Filtering passed on Pre-established analysis parameters
+discarded_rows1 <- filter(cars, price > 75000)
+discarded_rows2 <- filter(cars, is_new == TRUE)
+discarded_rows3 <- filter(cars, year >= 2020)
+discarded_rows4 <- filter(cars, year < 1995)
+discarded_rows5 <- filter(cars, daysonmarket > 120)
+discarded_rows6 <- filter(cars, salvage == TRUE)
+discarded_rows7 <- filter(cars, theft_title == TRUE)
+discarded_rows8 <- filter(cars, frame_damaged == TRUE)
+
+discarded_rows <- bind_rows(discarded_rows1, 
+                            discarded_rows2, 
+                            discarded_rows3, 
+                            discarded_rows4, 
+                            discarded_rows5, 
+                            discarded_rows6,
+                            discarded_rows7, 
+                            discarded_rows8)
+
+discarded_rows <- distinct(discarded_rows)
+
+used_cars  <- anti_join(cars, discarded_rows, by = "id")
+
+# discarding columns that are empty, redundant, or outside scope of analysis
+discarded_cols1 <- c("vin", 
+                    "bed", 
+                    "bed_height", 
+                    "bed_length", 
+                    "cabin", 
+                    "combine_fuel_economy", 
+                    "description", 
+                    "franchise_make", 
+                    "fuel_tank_volume", 
+                    "interior_color", 
+                    "isCab", 
+                    "is_certified", 
+                    "is_cpo", 
+                    "is_oemcpo", 
+                    "listed_date", 
+                    "listing_id", 
+                    "main_picture_url", 
+                    "major_options", 
+                    "savings_amount", 
+                    "seller_rating", 
+                    "sp_id", 
+                    "transmission_display", 
+                    "trimId", 
+                    "trim_name", 
+                    "vehicle_damage_category", 
+                    "wheel_system_display",
+                    "is_new",
+                    "theft_title",
+                    "salvage", 
+                    "frame_damaged")
+
+used_cars <- dplyr::select(used_cars, -all_of(discarded_cols1))
+
+#summary(used_cars)
+
+# # number of na elements by column
+sapply(used_cars, function(x) sum(is.na(x)))
+
+# # number of unique elements by column
+sapply(used_cars, function(x) length(unique(x)))
+
+#cars
+rm(discarded_rows1, discarded_rows2, discarded_rows3, discarded_rows4, discarded_rows5, discarded_rows6, discarded_rows7, discarded_rows8)
+```
+
+### Geocode records
+
+```{r geocode_demo_info_match, eval= FALSE}
+
+# Our socioeconomic dataset is aggregated by fips code (county)
+# so we will need to identify the county of sale for each vehicle sale.
+
+# pull long/lat coords for conversion
+z_longlat    <- select(used_cars, c(longitude,latitude))
+
+# create map objects for matching
+z_county_map <- readShapeSpatial(paste0(fp_raw_data, "tl_2013_us_county.shp"), proj4string=CRS("+proj=longlat +datum=NAD83"))
+
+z_coords_map <- SpatialPoints(z_longlat, proj4string=CRS("+proj=longlat +datum=NAD83"))
+
+# match map objects
+z_indices    <- over(z_coords_map, z_county_map)
+
+# create new columns for matching
+z_county_col <- select(z_indices, c(GEOID,NAMELSAD))
+
+used_cars$county_name <- z_county_col$NAMELSAD
+used_cars$county_fips <- z_county_col$GEOID
+
+# need to make fips code in augment dataset
+demos$county_fips = as.character(paste0(demos$st_id,demos$cty_id))
+
+# fips code correction, likely due to version mismatch
+used_cars$county_fips <- dplyr::recode(used_cars$county_fips, "51515" = "51019")
+
+# need country index column for filtering
+used_cars$country <- str_extract(used_cars$county_fips, "^.{2}")
+
+# Somehow, vehicle sales from outside the U.S. made it into the dataset.
+# This analysis is focused on used cars in the U.S.
+# AMERICAN SAMOA FIPS = 60
+# GUAM FIPS = 66
+# PUERTO RICO = 72
+# VIRGIN ISLANDS = 78
+
+discarded_rows8   <- filter(used_cars, country %in% c("60","66","72","78"))
+
+used_cars         <- filter(used_cars, !country %in% c("60","66","72", "78"))
+
+
+# make sure this is character variable and ready to recieve socio-economic data
+used_cars$county_fips <- as.character(used_cars$county_fips)
+
+# match dataframes on county fips column, deliver data to dataframe
+used_cars <- left_join(used_cars, demos, by = "county_fips")
+```
+
+### Predictor variables, clean & recode
+
+```{r create_select_condense_predictors, eval= FALSE}
+
+# find best power variable, considering NAs, granularity, range of values, etc. 
+z_power <- select(used_cars, c("engine_cylinders",
+                               "engine_displacement", 
+                               "engine_type", 
+                               "horsepower", 
+                               "power",
+                               "torque"))
+# keep horsepower
+
+
+# keep highest value between city/highway mpg
+used_cars$best_mpg <- with(used_cars, pmax(city_fuel_economy, highway_fuel_economy))
+
+# find best size variable, considering NAs, granularity, range of values, etc. 
+z_size <- select(used_cars, c("back_legroom", 
+                              "front_legroom", 
+                              "height", 
+                              "length", 
+                              "maximum_seating", 
+                              "wheelbase", 
+                              "width"))
+
+# remove chars for coding
+z_size$height          <- as.numeric(str_remove(z_size$height, fixed(" in")))
+z_size$length          <- as.numeric(str_remove(z_size$length, fixed(" in")))
+z_size$width           <- as.numeric(str_remove(z_size$width, fixed(" in")))
+z_size$wheelbase       <- as.numeric(str_remove(z_size$wheelbase, fixed(" in")))
+z_size$maximum_seating <- as.numeric(str_remove(z_size$maximum_seating, fixed(" seats")))
+
+# create cubic volume variable
+z_size <- mutate(z_size, cubic_in = width * length * height)
+
+# transfer clean columns
+used_cars$maximum_seating <- z_size$maximum_seating
+used_cars$wheelbase       <- z_size$wheelbase
+used_cars$cubic_in        <- z_size$cubic_in
+
+
+# create binary variable that identifies high luxury, collector, exotic, etc. vehicle sales.
+# all vehicle makes in the dataset
+z_allbrands <- sort(unique(used_cars$make_name))
+
+# manually created list of reasonably common brands, see z_uncommon vector for its compliment
+z_normbrand <- c("Acura",
+                 "Alfa Romeo", 
+                 "Audi",
+                 "BMW",
+                 "Buick",
+                 "Cadillac",
+                 "Chevrolet",
+                 "Chrysler",
+                 "Dodge",
+                 "FIAT",
+                 "Ford",
+                 "Genesis",
+                 "Geo",
+                 "GMC",
+                 "Honda",
+                 "Hummer",
+                 "Hyundai",
+                 "INFINITI",
+                 "Isuzu",
+                 "Jaguar",
+                 "Jeep",
+                 "Kia",
+                 "Land Rover",
+                 "Lexus",
+                 "Lincoln",
+                 "Mazda",
+                 "Mercedes-Benz",
+                 "Mercury",
+                 "MINI",
+                 "Mitsubishi",
+                 "Nissan",
+                 "Oldsmobile",
+                 "Plymouth",
+                 "Pontiac",
+                 "Porsche",
+                 "RAM",
+                 "Saab",
+                 "Saturn",
+                 "Suzuki",
+                 "Scion",
+                 "smart",
+                 "Toyota",
+                 "Tesla",
+                 "Subaru",
+                 "Volkswagen",
+                 "Volvo")
+
+# remove the common brands from all brands to generate uncommon list.
+z_uncommon <- z_allbrands[-pmatch(z_normbrand, z_allbrands)]
+
+# make home for results in dataset
+used_cars$uncommon_make <-rep(0, )
+
+# code binary variable, 1 if make found in uncommon list.
+used_cars <- mutate(used_cars, 
+                    uncommon_make = case_when(make_name %in% z_uncommon ~ "1",
+                                            # catch condition- without, will NA remaining entries
+                                            TRUE ~ as.character(uncommon_make)))
+
+# create fuel category variable
+used_cars$spcl_fuel  <-rep(0, )
+
+# We will generally be condensing the categories found in the raw dataset to simplify model selection.
+used_cars <- mutate(used_cars, 
+                    spcl_fuel = case_when( fuel_type == "Electric" | fuel_type == "Hybrid"  ~ "ELECTRIC-HYBRID", 
+                                           fuel_type == "Biodiesel" | fuel_type == "Compressed Natural Gas" | fuel_type == "Propane" ~ "BIODIESEL-CNG-PROPANE",
+                                           fuel_type == "Diesel" ~ "DIESEL",
+                                         # catch condition- without, will NA remaining entries
+                                           TRUE ~ as.character(spcl_fuel)))
+
+# create traction binary variable
+used_cars$AWD_4WD <-rep(0, )
+
+used_cars <- mutate(used_cars, 
+                    AWD_4WD = case_when(wheel_system == "AWD" | wheel_system == "4WD" ~ "1",
+                                        # catch condition- without, will NA remaining entries
+                                         TRUE ~ as.character(AWD_4WD)))
+
+
+# pull color columns for better analysis.
+z_color <- select(used_cars, c("exterior_color", "listing_color"))
+
+# identify which colors to recode (can't do them all).  We will attempt to recode the most prevalent NAs
+z_color <- filter(z_color, listing_color == "UNKNOWN")
+z_misc  <- group_by(z_color, exterior_color) %>% dplyr::summarise(n = n())
+z_misc  <- z_misc[order(z_misc$n, decreasing = TRUE),]
+z_misc$exterior_color[1:10]
+
+color_freq1 <- group_by(used_cars, listing_color) %>% dplyr::summarise(n = n())
+
+# recodes 120K color entries.
+used_cars <- mutate(used_cars, 
+                    listing_color = case_when(
+                                        exterior_color == "Satin Steel Metallic" ~ "GRAY", 
+                                        exterior_color == "Modern Steel Metallic" ~ "GRAY" , 
+                                        exterior_color == "Ebony Twilight Metallic" ~ "BLACK",
+                                        exterior_color == "Magnetic" ~ "GRAY",
+                                        exterior_color == "Iridescent Pearl Tricoat" ~ "WHITE",
+                                        exterior_color == "Fresh Powder" ~ "WHITE",
+                                        exterior_color == "Ruby Flare Pearl" ~ "RED",
+                                        exterior_color == "Sting-Gray Clearcoat" ~ "GRAY", 
+                                        exterior_color == "Maximum Steel Metallic Clearcoat"~"GRAY",
+                                        exterior_color == "Granite Pearlcoat" ~ "GRAY", 
+                                        exterior_color == "Graphite Metallic" ~ "GRAY",
+                                        exterior_color == "Graphite Shadow" ~ "GRAY",
+                                        exterior_color == "Billet Clearcoat" ~ "SILVER",
+                                        exterior_color == "Blueprint" ~ "BLUE",
+                                        exterior_color == "Modern Steel" ~ "GRAY",
+                                        exterior_color == "Lead Foot" ~ "GRAY",
+                                        exterior_color == "Magnetic Force" ~ "GRAY",
+                                        exterior_color == "Scarlet Ember Tintcoat" ~ "RED",
+                                        exterior_color == "Pepperdust Metallic" ~ "GOLD",
+                                        exterior_color == "Caviar" ~ "BLACK",
+                                        exterior_color == "Dark Sky Metallic" ~ "GRAY",
+                                        exterior_color == "Polished Metal Metallic" ~ "GRAY",
+                                        exterior_color == "Redline 2 Coat Pearl" ~ "RED",
+                                        exterior_color == "Celestite" ~ "BLUE",
+                                        exterior_color == "Wind Chill Pearl" ~ "WHITE",
+                                        # catch condition- without, will NA remaining entries
+                                        TRUE ~ as.character(listing_color)))
+#recoded ~50% of UNKNOWN 
+color_freq2 <- group_by(used_cars, listing_color) %>% dplyr::summarise(n = n())
+
+used_cars$listing_color <- replace(used_cars$listing_color, is.na(used_cars$listing_color), "UNKNOWN")
+
+#reduce number of categories in color
+used_cars <- mutate(used_cars, 
+                    listing_color = case_when(
+                                        listing_color == "BLACK" ~ "BLACK", 
+                                        listing_color == "SILVER" ~ "SILVER-GRAY" , 
+                                        listing_color == "GRAY" ~ "SILVER-GRAY",
+                                        listing_color == "RED" ~ "OTHER",
+                                        listing_color == "WHITE" ~ "WHITE",
+                                        listing_color == "BLUE" ~ "OTHER",
+                                        listing_color == "GOLD" ~ "OTHER",
+                                        listing_color == "BROWN" ~ "OTHER", 
+                                        listing_color == "YELLOW"~"OTHER",
+                                        listing_color == "ORANGE" ~ "OTHER", 
+                                        listing_color == "TEAL" ~ "OTHER",
+                                        listing_color == "GREEN" ~ "OTHER",
+                                        listing_color == "PURPLE" ~ "OTHER",
+                                        listing_color == "PINK" ~ "OTHER",
+                                        listing_color == "UNKNOWN" ~ "UNKNOWN"))
+
+# these throw warnings over and over if left in, known bug with dplyr group_by
+rm(z_misc)
+rm(color_freq1)
+rm(color_freq2)
+
+# condensing the categories found in the raw dataset to simplify model selection.
+z_body  <- unique(used_cars$body_type)
+
+used_cars <- mutate(used_cars, 
+                    body_type = case_when(
+                                        body_type == "Sedan" ~ "Sedan-Coupe-Hatchback", 
+                                        body_type == "Coupe" ~ "Sedan-Coupe-Hatchback" , 
+                                        body_type == "Hatchback" ~ "Sedan-Coupe-Hatchback",
+                                        body_type == "SUV / Crossover" ~ "SUV-Crossover",
+                                        body_type == "Pickup Truck" ~ "Pickup Truck",
+                                        body_type == "Wagon" ~ "Wagon-Minivan-Van",
+                                        body_type == "Minivan" ~ "Wagon-Minivan-Van",
+                                        body_type == "Van" ~ "Wagon-Minivan-Van", 
+                                        body_type == "Convertible"~"Convertible"))
+
+# recode vars to play nice with later functions
+used_cars$daysonmarket <- used_cars$daysonmarket + 1
+
+used_cars$year <- 2020 - used_cars$year
+
+# recoding binary variable "single owner"
+used_cars <- mutate(used_cars, 
+                    owner_count = case_when(owner_count == "1" ~ "1"))
+
+# recode dealer type
+used_cars$dealer_type <-rep(0, )
+used_cars <- mutate(used_cars, 
+                    dealer_type = case_when(sp_name == "Carvana" ~ "Agg.",
+                 sp_name == "Vroom" ~ "Agg.",
+                 sp_name == "Carlypso" ~ "Agg.",
+                 franchise_dealer == "TRUE" ~ "Franchise", 
+                 str_detect(sp_name, regex("CarMax", ignore_case = TRUE)) ~ "Agg.",
+                 str_detect(sp_name, regex("AutoNation", ignore_case = TRUE)) ~ "Agg.",
+                 str_detect(sp_name, regex("Acura", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("Alfa Romeo", ignore_case = TRUE)) ~ "Franchise",  
+                 str_detect(sp_name, regex("Audi", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("BMW", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("Buick", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("Cadillac", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("Chevrolet", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("Chrysler", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("Dodge", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("FIAT", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("Ford", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("GMC", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("Honda", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("Hyundai", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("INFINITI", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("Isuzu", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("Jaguar", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("Jeep", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("Kia", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("Land Rover", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("Lexus", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("Lincoln", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("Mazda", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("Mercedes-Benz", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("MINI", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("Mitsubishi", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("Nissan", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("Porsche", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("Saab", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("Scion", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("smart", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("Toyota", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("Tesla", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("Subaru", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("Volkswagen", ignore_case = TRUE)) ~ "Franchise", 
+                 str_detect(sp_name, regex("Volvo", ignore_case = TRUE)) ~ "Franchise",
+                 fleet == "TRUE" ~ "Fleet",
+                 str_detect(sp_name, regex("rent a car", ignore_case = TRUE)) ~ "Fleet",
+                 str_detect(sp_name, regex("rent-a-car", ignore_case = TRUE)) ~ "Fleet",
+                 str_detect(sp_name, regex("rentals", ignore_case = TRUE)) ~ "Fleet"))
+
+# recoding binary variable "has accidents"
+used_cars <- mutate(used_cars, 
+                    has_accidents = case_when(has_accidents == "TRUE" ~ "1"))
+
+# recode NAs to zero (we use this to identify independent dealers in dealer_type column)
+used_cars$owner_count      <- replace(used_cars$owner_count, is.na(used_cars$owner_count), 0)
+used_cars$dealer_type      <- replace(used_cars$dealer_type, is.na(used_cars$dealer_type), 0)
+used_cars$has_accidents    <- replace(used_cars$has_accidents, is.na(used_cars$has_accidents), 0)
+
+rm(z_color, z_coords_map, z_county_col, z_county_map, z_indices, z_longlat, z_power, z_size)
+```
+
+```{r numbers_formats_factors, eval= FALSE}
+
+# format numeric columns
+used_cars$poverty_percent <- as.numeric(used_cars$poverty_percent)
+used_cars$median_income   <- gsub(",", "", used_cars$median_income)
+used_cars$median_income   <- as.numeric(used_cars$median_income)
+
+# prettier column names, old name = new name
+used_cars <-dplyr::rename(used_cars, single_owner = owner_count, 
+                              county = county_name.y, 
+                              state = state_name,
+                              color = listing_color,
+                              max_seating = maximum_seating,
+                              age = year)
+
+# coding NA as unknown
+used_cars$color     <- replace(used_cars$color, is.na(used_cars$color), "UNKNOWN")
+used_cars$body_type <- replace(used_cars$body_type, is.na(used_cars$body_type), "UNKNOWN")
+
+# identify factors for R
+cats             <- c("body_type", "color", "uncommon_make", "spcl_fuel", "AWD_4WD", "single_owner", "dealer_type", "has_accidents")
+used_cars[, cats]<- lapply(used_cars[, cats], as.factor)
+
+# manually set default of category
+levels(used_cars$body_type)
+used_cars$body_type <- relevel(used_cars$body_type, "Sedan-Coupe-Hatchback")
+
+# manually set default of category
+levels(used_cars$color)
+used_cars$color <- relevel(used_cars$color, "WHITE")
+
+sapply(used_cars, function(x) class(x))
+```
+
+### Filter to complete cases (save dataset)
+
+```{r complete_cases_dataset, eval= FALSE}
+
+# these are donor columns that will be discarded below.
+discarded_cols2 <- c("city", 
+                    "dealer_zip",
+                    "latitude", 
+                    "longitude",
+                    "county_name.x",
+                    "county_fips",
+                    "country",
+                    "st_id",
+                    "cty_id",
+                    "state_abv",
+                    "engine_cylinders",
+                    "engine_displacement", 
+                    "engine_type", 
+                    "power",
+                    "torque",
+                    "city_fuel_economy",
+                    "highway_fuel_economy",
+                    "back_legroom",
+                    "front_legroom",
+                    "height", 
+                    "length", 
+                    "width",
+                    "exterior_color", 
+                    "fuel_type", 
+                    "make_name",
+                    "model_name",
+                    "transmission",
+                    "wheel_system")
+
+# these are columns that we will keep 
+reorder <- c("price", 
+             "age",
+             "mileage",
+             "daysonmarket",      
+             "horsepower",
+             "best_mpg",
+             "cubic_in", 
+             "wheelbase",
+             "max_seating",
+             "median_income",
+             "poverty_percent",   
+             "asian_only_percent", 
+             "black_only_percent", 
+             "hispanic_percent",   
+             "white_only_percent", 
+             "body_type",
+             "color",
+             "uncommon_make",
+             "spcl_fuel",
+             "AWD_4WD",
+             "single_owner",
+             "dealer_type",
+             "has_accidents",        
+             "median_income",
+             "poverty_percent",   
+             "asian_only_percent", 
+             "black_only_percent", 
+             "hispanic_percent",   
+             "white_only_percent", 
+             "state",
+             "county",
+             "id")
+# select the reordered columns
+used_cars <- dplyr::select(used_cars, all_of(reorder))
+
+
+# using complete cases per instructor, ran out of time on imputation
+used_cars_cc <- used_cars[complete.cases(used_cars), ]
+
+save(used_cars_cc, file = paste0(fp_data_obj,"used_car_data.RData"))
+```
+
+### Filter to california sales (save dataset)
+
+```{r sample_CA_dataset, eval= FALSE}
+
+# due to computational limitations that arose mid-project, we are forced to narrow our dataframe.
+# this limitation also guides our refocus to only California.
+
+
+set.seed(1234)
+
+# only concerned with sales inside California now.
+used_cars_ca <- filter(used_cars_cc, state=="California")
+
+# randomly sample n = 25000
+used_cars_ca <- sample_n(used_cars_ca, 25000)
+
+# won't be needing these identifiers moving forward
+discarded_cols3<- c("county", "state")
+used_cars_ca    <- as.data.frame(select(used_cars_ca, -discarded_cols3)) 
+
+
+# clean up discarded columns, may be needed for reference
+discarded_cols <- append(discarded_cols1, discarded_cols2)
+discarded_cols <- append(discarded_cols, discarded_cols3)
+discarded_cols <- unique(discarded_cols)
+
+set.seed(NULL)
+
+# save(used_cars_ca, file = paste0(fp_raw_data,"used_car_data_CA.RData"))
+```
+
+## Exploratory data analysis
+
+```{r regression_full_model, fig.width = 10, fig.height = 2.5}
+
+# exploratory regression, expect craziness
+lm_full1 <- lm(price ~ ., data = used_cars_ca[1:23]) 
+
+summary(lm_full1)
+
+par(mfrow=c(1,4))
+
+plot(lm_full1)
+```
+
+```{r intro_scatterplots, fig.width = 10, fig.height = 16}
+par(mfrow=c(5, 3))
+
+plot_pairs_cont(used_cars_ca, yvar = "price")
+
+hist(used_cars_ca$price, breaks = 15, xlab = "price", main = "Histogram of Used Vehicle Prices")
+```
+
+```{r visual_correction_log_response, fig.width = 10, fig.height = 16}
+# log response based on histogram and condensed masses of points on scatterplots.
+used_cars_ca_log_resp <- used_cars_ca
+used_cars_ca_log_resp[,1] <- log(used_cars_ca[,1])
+names(used_cars_ca_log_resp)[1] <- "log_price"
+
+par(mfrow=c(5, 3))
+plot_pairs_cont(used_cars_ca_log_resp, yvar = "log_price")
+hist(used_cars_ca_log_resp$log_price, breaks = 15, xlab = "log(price)", main = "Histogram of Used Vehicle Prices, Logged")
+```
+
+```{r visual_check_log_others, fig.width = 10, fig.height = 16}
+
+# check if log transformation would benefit other variables
+used_cars_ca_log_all <- used_cars_ca_log_resp
+
+used_cars_ca_log_all[2:15]  <- log(used_cars_ca_log_resp[2:15])
+
+# will compare a full set of scatterplots, one where all predictor variables are logged.
+par(mfrow=c(5, 3))
+plot_pairs_cont(used_cars_ca_log_resp, yvar = "log_price")
+hist(used_cars_ca_log_resp$log_price, breaks = 15, xlab = "log(price)", main = "Histogram of Used Vehicle Prices, Logged")
+
+plot_pairs_cont(used_cars_ca_log_all, yvar = "log_price")
+hist(used_cars_ca_log_all$log_price, breaks = 15, xlab = "log(price)", main = "Histogram of Used Vehicle Prices, Logged")
+
+used_cars_ca_transformed <- used_cars_ca_log_resp
+
+
+#Visual inspection leads to log of all but mileage, age, daysonmarket
+used_cars_ca_transformed[5:8] <- log(used_cars_ca[5:8])
+names(used_cars_ca_transformed)[5]  <- "log_horsepower"
+names(used_cars_ca_transformed)[6]  <- "log_best_mpg"
+names(used_cars_ca_transformed)[7]  <- "log_cubic_in"
+names(used_cars_ca_transformed)[8]  <- "log_wheelbase"
+
+used_cars_ca_transformed[10:15] <- log(used_cars_ca[10:15])
+names(used_cars_ca_transformed)[10] <- "log_median_income"
+names(used_cars_ca_transformed)[11] <- "log_poverty_perc"
+names(used_cars_ca_transformed)[12] <- "log_asian_only_perc"
+names(used_cars_ca_transformed)[13] <- "log_black_only_perc"
+names(used_cars_ca_transformed)[14] <- "log_hisp_only_perc"
+names(used_cars_ca_transformed)[15] <- "log_white_only_perc"
+```
+
+```{r visual_correction_scatterplots, fig.width = 10, fig.height = 16}
+# We turn our attention to these scatterplots for EDA
+par(mfrow=c(5, 3))
+plot_pairs_cont(used_cars_ca_transformed, yvar = "log_price")
+```
+
+```{r visual_correction_boxplots, fig.width = 10, fig.height = 6}
+# boxplots for categorical variables
+par(mfrow=c(2, 4))
+plot_pairs_cat(used_cars_ca_transformed, yvar = "log_price")
+```
+
+```{r visual_correction_pairs, fig.width = 10, fig.height = 8.5}
+
+# pairs plots will give us more detailed information about the relationships within the dataset
+pairs1 <- c("log_price",               
+"age",               
+"mileage",            
+"log_horsepower",         
+"log_best_mpg", 
+"log_cubic_in",
+"log_wheelbase", 
+"daysonmarket")        
+
+used_pair1 <- dplyr::select(used_cars_ca_transformed, all_of(pairs1))
+
+pairs2 <- c("log_price",
+"max_seating",
+"body_type",        
+"color",
+"uncommon_make",
+"spcl_fuel",            
+"single_owner",              
+"has_accidents")
+
+used_pair2 <- dplyr::select(used_cars_ca_transformed, all_of(pairs2))
+
+
+pairs3 <- c("log_price",
+"log_median_income",      
+"log_poverty_perc",    
+"log_asian_only_perc", 
+"log_black_only_perc",
+"log_hisp_only_perc",   
+"log_white_only_perc")
+used_pair3 <- dplyr::select(used_cars_ca_transformed, all_of(pairs3))
+
+
+ggpairs(used_pair1, progress = FALSE)
+ggpairs(used_pair2, progress = FALSE)
+ggpairs(used_pair3, progress = FALSE)
+```
+
+### Added variable plots
+```{r added_var_plots, fig.width = 12, fig.height = 20, eval = FALSE}
+
+# we'll need a list of response variables for our automated plotting
+lm_ca_vars <- colnames(used_cars_ca_transformed[2:23])
+
+
+# These residuals contain the information about Y not already explained by the other variables in the model.
+fit_y_on_x_ca <- lapply(lm_ca_vars, function(x)
+              lm(as.formula(paste0("log_price ~ . -",x)), data=used_cars_ca_transformed))
+
+
+# These residuals contain the new information that our variable of interest brings to the table. (not explained by other variables in model)
+fit_x_on_x_ca <- lapply(lm_ca_vars, function(x)
+              lm(as.formula(paste0(x," ~ . - log_price")), data=used_cars_ca_transformed))
+
+
+#need to initialize storage list to store info needed for regression overlay
+abfit <- vector(mode = "list", length = 14)
+
+for (i in 1:14) {abfit[[i]] <- lm(fit_y_on_x_ca[[i]]$residuals ~ fit_x_on_x_ca[[i]]$residuals)}
+
+# these first plots will be leave-one-out style for each continuous variable.
+
+par(mfrow=c(5, 3))
+
+# Added variable Plot - "age"
+y <- fit_y_on_x_ca[[1]]$residuals
+x <- fit_x_on_x_ca[[1]]$residuals
+plot(x, y, main = "AV Plot: Age", ylab= "log(Price) | others", xlab = "Age | others")
+abline(abfit[[1]], col = "red", lwd = 2)
+
+# Added variable Plot - "Mileage"
+y <- fit_y_on_x_ca[[2]]$residuals
+x <- fit_x_on_x_ca[[2]]$residuals
+plot(x, y, main = "AV Plot: Mileage", ylab= "log(Price) | others", xlab = "Mileage | others")
+abline(abfit[[2]], col = "red", lwd = 2)
+
+# Added variable Plot - "Days on Market"
+y <- fit_y_on_x_ca[[3]]$residuals
+x <- fit_x_on_x_ca[[3]]$residuals
+plot(x, y, main = "AV Plot: Days on Market", ylab= "log(Price) | others", xlab = "Days on Market | others")
+abline(abfit[[3]], col = "red", lwd = 2)
+
+# Added variable Plot - "Horsepower"
+y <- fit_y_on_x_ca[[4]]$residuals
+x <- fit_x_on_x_ca[[4]]$residuals
+plot(x, y, main = "AV Plot: log(Horsepower)", ylab= "log(Price) | others", xlab = "log(Horsepower) | others")
+abline(abfit[[4]], col = "red", lwd = 2)
+
+# Added variable Plot - "best mpg"
+y <- fit_y_on_x_ca[[5]]$residuals
+x <- fit_x_on_x_ca[[5]]$residuals
+plot(x, y, main = "AV Plot: log(Best MPG)", ylab= "log(Price) | others", xlab = "log(Best MPG) | others")
+abline(abfit[[5]], col = "red", lwd = 2)
+
+# Added variable Plot - "cubic in"
+y <- fit_y_on_x_ca[[6]]$residuals
+x <- fit_x_on_x_ca[[6]]$residuals
+plot(x, y, main = "AV Plot: log(Cubic Volume)", ylab= "log(Price) | others", xlab = "log(Cubic Volume) | others")
+abline(abfit[[6]], col = "red", lwd = 2)
+
+# Added variable Plot - "wheelbase"
+y <- fit_y_on_x_ca[[7]]$residuals
+x <- fit_x_on_x_ca[[7]]$residuals
+plot(x, y, main = "AV Plot: log(Wheelbase)", ylab= "log(Price) | others", xlab = "log(Wheelbase) | others")
+abline(abfit[[7]], col = "red", lwd = 2)
+
+# Added variable Plot - "max seating"
+y <- fit_y_on_x_ca[[8]]$residuals
+x <- fit_x_on_x_ca[[8]]$residuals
+plot(x, y, main = "AV Plot: Max Seating", ylab= "log(Price) | others", xlab = "Max Seating | others")
+abline(abfit[[8]], col = "red", lwd = 2)
+
+# Added variable Plot - "median income"
+y <- fit_y_on_x_ca[[9]]$residuals
+x <- fit_x_on_x_ca[[9]]$residuals
+plot(x, y, main = "AV Plot: log(Median Income)", ylab= "log(Price) | others", xlab = "log(Median Income) | others")
+abline(abfit[[9]], col = "red", lwd = 2)
+
+# Added variable Plot - "poverty percent"
+y <- fit_y_on_x_ca[[10]]$residuals
+x <- fit_x_on_x_ca[[10]]$residuals
+plot(x, y, main = "AV Plot: log(% Poverty)", ylab= "log(Price) | others", xlab = "log(% Poverty) | others")
+abline(abfit[[10]], col = "red", lwd = 2)
+
+# Added variable Plot - "asian only percent"
+y <- fit_y_on_x_ca[[11]]$residuals
+x <- fit_x_on_x_ca[[11]]$residuals
+plot(x, y, main = "AV Plot: log(% Asian Only)", ylab= "log(Price) | others", xlab = "log(% Asian Only) | others")
+abline(abfit[[11]], col = "red", lwd = 2)
+
+# Added variable Plot - "black only percent"
+y <- fit_y_on_x_ca[[12]]$residuals
+x <- fit_x_on_x_ca[[12]]$residuals
+plot(x, y, main = "AV Plot: log(% Black Only)", ylab= "log(Price) | others", xlab = "log(% Black Only) | others")
+abline(abfit[[12]], col = "red", lwd = 2)
+
+# Added variable Plot - "hispanic only percent"
+y <- fit_y_on_x_ca[[13]]$residuals
+x <- fit_x_on_x_ca[[13]]$residuals
+plot(x, y, main = "AV Plot: log(% Hispanic Only)", ylab= "log(Price) | others", xlab = "log(% Hispanic Only) | others")
+abline(abfit[[13]], col = "red", lwd = 2)
+
+#Added variable Plot - "white only percent"
+y <- fit_y_on_x_ca[[14]]$residuals
+x <- fit_x_on_x_ca[[14]]$residuals
+plot(x, y, main = "AV Plot: log(% White Only)", ylab= "log(Price) | others", xlab = "log(White Only Percent) | others")
+abline(abfit[[14]], col = "red", lwd = 2)
+```
+
+```{r AV_plots_special, fig.width = 10, fig.height = 6}
+
+## These added variable plots also remove the variable's likely collinear counterpart as well, 
+## for comparison of incremental value.
+avplot_hp        <- select(used_cars_ca_transformed, -c("log_best_mpg", "id"))
+avplot_mpg       <- select(used_cars_ca_transformed, -c("log_horsepower", "id"))
+
+avplot_vol       <- select(used_cars_ca_transformed, -c("log_wheelbase", "id"))
+avplot_whl       <- select(used_cars_ca_transformed, -c("log_cubic_in", "id")) 
+
+avplot_age       <- select(used_cars_ca_transformed, -c("mileage", "id"))
+avplot_mileage   <- select(used_cars_ca_transformed, -c("age", "id"))
+
+# avplot_hp
+x_1 <- lm(log_horsepower ~ . - log_price, data = avplot_hp)
+y_1 <- lm(log_price ~ . -log_horsepower, data = avplot_hp)
+abfit_1 <- lm(y_1$residuals ~ x_1$residuals)
+
+
+# avplot_mp
+x_2 <- lm(log_best_mpg ~ . - log_price, data = avplot_mpg)
+y_2 <- lm(log_price ~ . -log_best_mpg, data = avplot_mpg)
+abfit_2 <- lm(y_2$residuals ~ x_2$residuals)
+
+
+# # setup for avplot_vol
+x_3 <- lm(log_cubic_in ~ . - log_price, data = avplot_vol)
+y_3 <- lm(log_price ~ . - log_cubic_in, data = avplot_vol)
+abfit_3 <- lm(y_3$residuals ~ x_3$residuals)
+
+
+# setup for avplot_whl
+x_4 <- lm(log_wheelbase ~ . - log_price, data = avplot_whl)
+y_4 <- lm(log_price ~ . - log_wheelbase, data = avplot_whl)
+abfit_4 <- lm(y_4$residuals ~ x_4$residuals)
+
+
+# setup for avplot_age 
+x_5 <- lm(age ~ . - log_price, data = avplot_age)
+y_5 <- lm(log_price ~ . - age, data = avplot_age)
+abfit_5 <- lm(y_5$residuals ~ x_5$residuals)
+
+
+# setup for avplot_mileage
+x_6 <- lm(mileage ~ . - log_price, data = avplot_mileage)
+y_6 <- lm(log_price ~ . - mileage, data = avplot_mileage)
+abfit_6 <- lm(y_6$residuals ~ x_6$residuals)
+
+par(mfrow=c(2, 3))
+# avplot_hp
+y <- y_1$residuals
+x <- x_1$residuals
+plot(x, y, main = "AV Plot: log(Horsepower)", ylab= "price ~ model(no mpg) residuals", xlab = "income ~ model(no mpg) residuals")
+abline(abfit_1, col = "red", lwd = 2)
+
+# avplot_mpg
+y <- y_2$residuals
+x <- x_2$residuals
+plot(x, y, main = "AV Plot: log(Best MPG)", ylab= "price ~ model(no horsepower) residuals", xlab = "income ~ model(no horsepower) residuals")
+abline(abfit_2, col = "red", lwd = 2)
+
+# avplot_vol
+y <- y_3$residuals
+x <- x_3$residuals
+plot(x, y, main = "AV Plot: log(Cubic Volume)", ylab= "price ~ model(no wheelbase) residuals", xlab = "income ~ model(no wheelbase) residuals")
+abline(abfit_3, col = "red", lwd = 2)
+
+# avplot_whl
+y <- y_4$residuals
+x <- x_4$residuals
+plot(x, y, main = "AV Plot: log(Wheelbase)", ylab= "price ~ model(no volume) residuals", xlab = "income ~ model(no volume) residuals")
+abline(abfit_4, col = "red", lwd = 2)
+
+# avplot_age 
+y <- y_5$residuals
+x <- x_5$residuals
+plot(x, y, main = "AV Plot: Age", ylab= "price ~ model(no mileage) residuals", xlab = "income ~ model(no mileage) residuals")
+abline(abfit_5, col = "red", lwd = 2)
+
+
+# avplot_mileage
+y <- y_6$residuals
+x <- x_6$residuals
+plot(x, y, main = "AV Plot: Mileage", ylab= "price ~ model(no age) residuals", xlab = "income ~ model(no age) residuals")
+abline(abfit_6, col = "red", lwd = 2)
+```
+
+## Model building & analysis
+```{r regression_visual_correction, fig.width = 10, fig.height = 3}
+# our model after the transformations that followed our visual assessment.                  
+bestmod0 <- lm(log_price ~ ., data = used_cars_ca_transformed[1:23]) 
+
+summary(bestmod0)
+par(mfrow=c(1,4))
+plot(bestmod0)
+```
+
+```{r regression_stepwise, fig.width = 10, fig.height = 3}}
+# perform stepwise regression algorithim to simplify model.
+lm_step  <- step(lm(log_price ~ ., data=used_cars_ca_transformed[1:23]), direction = "forward")
+
+# a direct copy of the model above, save for reference
+bestmod1 <- lm(log(price) ~ age + 
+                  mileage + 
+                  daysonmarket + 
+                  log(horsepower) + 
+                  log(best_mpg) +
+                  log(cubic_in) +
+                  log(wheelbase) + 
+                  max_seating + 
+                  log(median_income) +
+                  log(poverty_percent) + 
+                  log(asian_only_percent) + 
+                  log(hispanic_percent) + 
+                  log(white_only_percent) + 
+                  log(black_only_percent) +
+                  body_type +
+                  color +
+                  uncommon_make + 
+                  spcl_fuel + 
+                  AWD_4WD + 
+                  single_owner + 
+                  dealer_type + 
+                  has_accidents, 
+    data = used_cars_ca[1:23])
+
+# The stepwise algorithm did not reduce our model, we'll have to do that ourselves.
+# We're pretty confident that our response variable should be logged...
+# but what are the best transformations for our predictors?
+
+summary(mod_boxcox <- powerTransform(cbind(mileage, 
+                             horsepower, 
+                             daysonmarket, 
+                             age, 
+                             best_mpg, 
+                             cubic_in, 
+                             wheelbase, 
+                             max_seating, 
+                             median_income,
+                             poverty_percent,
+                             asian_only_percent,
+                             black_only_percent,
+                             hispanic_percent,
+                             white_only_percent) ~ log(price), data = used_cars_ca))
+
+# we're not willing to accept the perfect transformations for parsimony reasons, but the summary
+# does tell us that logging all predictors produces better results than leaving them alone.
+
+# late in the game I had a brilliant idea, LRT test the transforms we DID use!!!
+testTransform(mod_boxcox, c(1, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+
+
+# because we're not willing to accept the best transformations, let's make sure logging the response is
+# appropriate given the transformations we kept
+fit_boxcox <- lm(price ~ age + 
+                  mileage + 
+                  daysonmarket + 
+                  log(horsepower) + 
+                  log(best_mpg) +
+                  log(cubic_in) +
+                  log(wheelbase) + 
+                  max_seating + 
+                  log(median_income) +
+                  log(poverty_percent) + 
+                  log(asian_only_percent) + 
+                  log(hispanic_percent) + 
+                  log(white_only_percent) + 
+                  log(black_only_percent) +
+                  body_type +
+                  color +
+                  uncommon_make + 
+                  spcl_fuel + 
+                  AWD_4WD + 
+                  single_owner + 
+                  dealer_type + 
+                  has_accidents, 
+    data = used_cars_ca[1:23])
+
+
+# this plot tells us the preferred transformation for our response.
+inverseResponsePlot(fit_boxcox)
+
+
+# recall our primary objective is not price prediction. 
+
+# remove body type and color for parsimony and ease of interpretation
+# after body type and color are removed from the model, the black percentage variable becomes insignificant. 
+# after we remove the black variable, the median income variable becomes insignificant.
+# after we remove the median income variable cubic volume becomes insigificant and the model stabilizes.
+
+bestmod2 <- lm(log(price) ~ age + 
+                  mileage + 
+                  daysonmarket + 
+                  log(horsepower) + 
+                  log(best_mpg) +
+              # log(cubic_in) +
+                  log(wheelbase) + 
+                  max_seating + 
+              # log(median_income) +
+                  log(poverty_percent) + 
+                  log(asian_only_percent) + 
+                  log(hispanic_percent) + 
+                  log(white_only_percent) + 
+              # log(black_only_percent) +
+              # body_type +
+              # color +
+                  uncommon_make + 
+                  spcl_fuel + 
+                  AWD_4WD + 
+                  single_owner + 
+                  dealer_type + 
+                  has_accidents, 
+    data = used_cars_ca[1:23])
+
+summary(bestmod2)
+par(mfrow=c(1,4))
+plot(bestmod2)
+```
+
+```{r best_subsets_model_after_visual_corrections, eval = FALSE}
+
+# regression subsets selection
+preds <- with(used_cars_ca_transformed[1:23], cbind(age, 
+               mileage,
+               daysonmarket,
+               log_horsepower,
+               log_best_mpg,
+               log_cubic_in,
+               log_wheelbase,
+               max_seating,
+               log_median_income,
+               log_poverty_perc,
+               log_asian_only_perc,
+               log_black_only_perc,
+               log_hisp_only_perc,
+               log_white_only_perc,
+               body_type,
+               color, 
+               uncommon_make, 
+               spcl_fuel, 
+               AWD_4WD, 
+               single_owner, 
+               dealer_type,
+               has_accidents))
+
+model  <- regsubsets(preds, y = used_cars_ca_transformed$log_price,
+                   nbest = 30,    # save the best # for each number of variables
+                   nvmax = 22,    # maximum number of variables allowed in the model
+                   really.big = TRUE )  # for larger datasets
+
+model_summ <- summary(model)
+
+number_variables <- apply(model_summ$which, 1, sum)
+
+criteria <- data.frame(p     = number_variables,
+                       rss   = model_summ$rss, 
+                       rsq   = model_summ$rsq, 
+                       adjr2 = model_summ$adjr2, 
+                       cp    = model_summ$cp,
+                       bic   = model_summ$bic)
+
+par(mfrow=c(1, 3))
+
+plot_best_model(number_variables, 'adjr2', 'max')
+plot_best_model(number_variables, 'cp', 'min')
+plot_best_model(number_variables, 'bic', 'min')
+```
+
+```{r variable_freq_best_models, fig.width = 7, fig.height = 5, eval = FALSE}
+#par(mfrow=c(2, 1))
+
+plot(model, scale = "bic", main = "Frequency of Variables in Best Models: BIC")
+#plot(model, scale = "Cp", main = "Frequency of Variables in Best Models: Mallows's Cp")
+```
+
+```{r REGRESSION_best_model_bic, fig.width = 10, fig.height = 3, eval = FALSE}
+
+select_best_models <- model_summ$which[order(criteria$bic),]
+ 
+best_model_dat <- used_cars_ca_transformed[,-which(names(used_cars_ca_transformed) %in% c("log_price","id"))][,select_best_models[1,-1]]
+
+best_model_dat <- data.frame(log_price = used_cars_ca_transformed$log_price, best_model_dat)
+
+lm_bic3 <- lm(log_price~., data=best_model_dat)
+
+summary(lm_bic3)
+
+par(mfrow=c(1,4))
+plot(lm_bic3)
+```
+
+```{r extract_best_model_adjr2, fig.width = 10, fig.height = 3, eval = FALSE}
+criteria <- data.frame(p     = number_variables,
+                       rss   = model_summ$rss, 
+                       rsq   = model_summ$rsq, 
+                       adjr2 = model_summ$adjr2, 
+                       cp    = model_summ$cp,
+                       bic   = model_summ$bic)
+
+select_best_models <- model_summ$which[order(-criteria$adjr2),]
+
+best_model_dat <- used_cars_ca_transformed[,-which(names(used_cars_ca_transformed) %in% c("log_price","id"))][,select_best_models[1,-1]]
+
+best_model_dat <- data.frame(log_price = used_cars_ca_transformed$log_price, best_model_dat)
+model3_adjr2 <- lm(log_price~., data=best_model_dat)
+
+
+par(mfrow=c(1,4))
+plot(model3_adjr2)
+```
+
+```{r extract_best_model_cp, fig.width = 10, fig.height = 3, eval = FALSE}
+
+select_best_models <- model_summ$which[order(criteria$cp),]
+
+best_model_dat <- used_cars_ca_transformed[,-which(names(used_cars_ca_transformed) %in% c("log_price","id"))][,select_best_models[1,-1]]
+
+best_model_dat <- data.frame(log_price = used_cars_ca_transformed$log_price, best_model_dat)
+model3_cp <- lm(log_price~., data = best_model_dat)
+
+summary(model3_cp)
+
+par(mfrow=c(1,4))
+plot(model3_cp)
+```
+
+```{r investigate_better_transformations_1, eval = FALSE}
+
+car_boxcox <-(powerTransform(cbind(mileage, 
+                             horsepower, 
+                             daysonmarket, 
+                             age, 
+                             best_mpg, 
+                             cubic_in, 
+                             wheelbase, 
+                             max_seating, 
+                             median_income,
+                             poverty_percent,
+                             asian_only_percent,
+                             black_only_percent,
+                             hispanic_percent,
+                             white_only_percent) ~ 1, data = used_cars_ca))
+
+summary(car_boxcox)
+
+#accept following transformations...
+boxcox_fit <- lm(price ~ 
+                     I(mileage ^ (1/3)) + 
+                     log(horsepower) + 
+                     I(daysonmarket ^ (1/3)) + 
+                     log(age) + 
+                     best_mpg + 
+                     cubic_in + 
+                     poly(wheelbase, 3) + 
+                     I(max_seating ^ (1/3)) + 
+                     median_income + 
+                     poverty_percent + 
+                     asian_only_percent + 
+                     black_only_percent + 
+                     hispanic_percent + 
+                     white_only_percent, data = used_cars_ca)
+
+inverseResponsePlot(boxcox_fit, lambda=c(-1, 0, 0.5, 1, 2))
+
+#log response.
+
+spreadLevelPlot(boxcox_fit)
+```
+
+```{r regression_boxcox_complex, fig.width = 10, fig.height = 3, eval = FALSE}
+
+lm_boxcox5 <- lm(log(price) ~ .
+                    + I(mileage ^ (1/3)) 
+                    + log(horsepower) 
+                    + I(daysonmarket ^ (1/3)) 
+                    + log(age) 
+                    + best_mpg 
+                    + cubic_in 
+                    + poly(wheelbase, 3) 
+                    + I(max_seating ^ (1/3)) 
+                    + median_income 
+                    + poverty_percent 
+                    + asian_only_percent 
+                    + black_only_percent 
+                    + hispanic_percent 
+                    + white_only_percent 
+                    + uncommon_make
+                    + spcl_fuel
+                    + AWD_4WD
+                    + body_type
+                    + single_owner
+                    + dealer_type
+                    + has_accidents,
+                    data = used_cars_ca[1:23])
+
+summary(lm_boxcox5)
+
+par(mfrow=c(1,4))
+plot(lm_boxcox5)
+```
+
+```{r investigate-better-transformations-2, eval = FALSE}
+#confirm appropriateness of logging response
+fit_boxcox2 <-lm(log(price) ~ horsepower + 
+                         daysonmarket +
+                         age +
+                         best_mpg +
+                         cubic_in +
+                         wheelbase +
+                         max_seating +
+                         median_income +
+                         poverty_percent +
+                         asian_only_percent +
+                         black_only_percent +
+                         hispanic_percent +
+                         white_only_percent, data = used_cars_ca)
+
+inverseResponsePlot(fit_boxcox2)
+
+#evaluate best transformations for logged response
+car_boxcox2 <-(powerTransform(cbind(mileage, 
+                             horsepower, 
+                             daysonmarket, 
+                             age, 
+                             best_mpg, 
+                             cubic_in, 
+                             wheelbase, 
+                             max_seating, 
+                             median_income,
+                             poverty_percent,
+                             asian_only_percent,
+                             black_only_percent,
+                             hispanic_percent,
+                             white_only_percent) ~ log(price), data = used_cars_ca))
+summary(car_boxcox2)
+
+
+# accept log of horsepower and price only for parsimony
+used_cars_ca_test     <- used_cars_ca
+used_cars_ca_test[, 1] <- log(used_cars_ca[, 1])
+used_cars_ca_test[, 5] <- log(used_cars_ca[, 5])
+
+names(used_cars_ca_test)[1] <- "log_price"
+names(used_cars_ca_test)[5] <- "log_horsepower"
+
+```
+
+```{r REGRESSION_boxcox_simple, fig.width = 10, fig.height = 3, eval = FALSE}
+
+# best model from this data
+preds <- with(used_cars_ca_test, cbind(age, 
+               mileage, 
+               log_horsepower, 
+               daysonmarket, 
+               age, 
+               best_mpg, 
+               cubic_in, 
+               wheelbase, 
+               max_seating, 
+               median_income,
+               poverty_percent,
+               asian_only_percent,
+               black_only_percent,
+               hispanic_percent,
+               white_only_percent,
+               body_type,
+               color, 
+               uncommon_make, 
+               spcl_fuel, 
+               AWD_4WD, 
+               single_owner, 
+               dealer_type, 
+               has_accidents))
+
+model  <- regsubsets(preds, y = used_cars_ca_test$log_price,
+                   nbest = 50,    # save the best # for each number of variables
+                   nvmax = 30,    # maximum number of variables allowed in the model
+                   really.big = TRUE )  # for larger datasets
+
+model_summ <- summary(model)
+
+select_best_models <- model_summ$which[order(criteria$bic),]
+ 
+best_model_dat <- used_cars_ca_test[,-which(names(used_cars_ca_test) %in% c("log_price","id"))][,select_best_models[1,-1]]
+
+best_model_dat <- data.frame(log_price = used_cars_ca_test$log_price, best_model_dat)
+
+lm_bestbox6 <- lm(log_price~., data=best_model_dat)
+
+summary(lm_bestbox6)
+par(mfrow=c(1,4))
+plot(lm_bestbox6)
+```
+
+
+## Investigate outliers (save results)
+
+```{r investigate_outliers, fig.width = 10, fig.height = 4}
+summary(bestmod2)
+par(mfrow=c(1,4))
+plot(bestmod2)
+
+# 10 most problematic outliers...maybe there is a remedy?
+outlier1 <- used_cars_ca[16536,]
+outlier2 <- used_cars_ca[13073,]
+outlier3 <- used_cars_ca[3728,]
+outlier4 <- used_cars_ca[10574,]
+outlier5 <- used_cars_ca[12848,]
+outlier6 <- used_cars_ca[12845,]
+outlier7 <- used_cars_ca[10572,]
+outlier8 <- used_cars_ca[2291,]
+outlier9 <- used_cars_ca[1007,]
+outlier10<- used_cars_ca[10570,]
+
+outliers <- rbind(outlier1, outlier2, outlier3, outlier4, outlier5, outlier6, outlier7, outlier8, outlier9, outlier10)
+outliers_id <- outliers$id
+
+outliers_df <- filter(cars, id %in% outliers_id) 
+outliers_df <- select(outliers_df, price, year, mileage, horsepower, make_name, model_name, trim_name, description, sp_name, id)
+
+save(outliers_id, outliers_df, file = paste0(fp_data_obj, "outliers.RData"))
+```
+
+```{r regression_remove_outliers, fig.width = 10, fig.height = 4}
+# our outliers appear to be real observations.  A common thread does not appear to run through all of them.  Let's fit a regression without them.
+used_cars_no_outliers <- filter(used_cars_ca, !id %in% outliers_id) 
+
+# best model regression without outliers
+bestmod_out <- lm(log(price) ~ age + 
+                  mileage + 
+                  daysonmarket + 
+                  log(horsepower) + 
+                  log(best_mpg) +
+              # log(cubic_in) +
+                  log(wheelbase) + 
+                  max_seating + 
+              # log(median_income) +
+                  log(poverty_percent) + 
+                  log(asian_only_percent) + 
+                  log(hispanic_percent) + 
+                  log(white_only_percent) + 
+              # log(black_only_percent) +
+              # body_type +
+              # color +
+                  uncommon_make + 
+                  spcl_fuel + 
+                  AWD_4WD + 
+                  single_owner + 
+                  dealer_type + 
+                  has_accidents, 
+    used_cars_no_outliers[1:23])
+
+summary(bestmod_out)
+BIC(bestmod_out)
+```
+
+## Investigate poverty interaction
+
+```{r investigate_poverty_interaction, eval = FALSE}
+
+# leading model 
+reduced <- lm(log(price) ~ age + 
+                  mileage + 
+                  daysonmarket + 
+                  log(horsepower) + 
+                  log(best_mpg) +
+              # log(cubic_in) +
+                  log(wheelbase) + 
+                  max_seating + 
+              # log(median_income) +
+                  log(poverty_percent) + 
+                  log(asian_only_percent) + 
+                  log(hispanic_percent) + 
+                  log(white_only_percent) + 
+              # log(black_only_percent) +
+              # body_type +
+              # color +
+                  uncommon_make + 
+                  spcl_fuel + 
+                  AWD_4WD + 
+                  single_owner + 
+                  dealer_type + 
+                  has_accidents, 
+    data = used_cars_ca[1:23])
+
+# investigate interaction between poverty and dealer type
+full <- lm(log(price) ~ age + 
+                  mileage + 
+                  daysonmarket + 
+                  log(horsepower) + 
+                  log(best_mpg) +
+                  log(wheelbase) + 
+                  max_seating + 
+                  log(poverty_percent) + 
+                  log(asian_only_percent) + 
+                  log(hispanic_percent) + 
+                  log(white_only_percent) + 
+                  uncommon_make + 
+                  spcl_fuel + 
+                  AWD_4WD + 
+                  single_owner + 
+                  dealer_type +
+          log(poverty_percent)*dealer_type +
+                  has_accidents, 
+    data = used_cars_ca[1:23])
+
+anova(reduced, full)
+
+summary(full)
+
+# store interaction regression for discussion.
+intmod1 <- full
+summary(intmod1)
+par(mfrow=c(1,4))
+plot(intmod1)
+
+
+reduced2 <- lm(log(price) ~ log(poverty_percent) + 
+                  dealer_type,
+    data = used_cars_ca[1:23])
+
+# investigate interaction between poverty and dealer type
+full2 <- lm(log(price) ~ log(poverty_percent) + 
+                  dealer_type +
+          log(poverty_percent)*dealer_type,
+    data = used_cars_ca[1:23])
+
+anova(reduced2, full2)
+summary(reduced2)
+summary(full2)
+
+texreg(intmod1, digits = 5, ci.force = TRUE, single.row = TRUE)
+texreg(reduced2, digits = 5, ci.force = TRUE, single.row = TRUE)
+texreg(full2, digits = 5, ci.force = TRUE, single.row = TRUE)
+
+#interaction model regression without outliers
+intmod_out <- lm(log(price) ~ age + 
+                  mileage + 
+                  daysonmarket + 
+                  log(horsepower) + 
+                  log(best_mpg) +
+                  log(wheelbase) + 
+                  max_seating + 
+                  log(poverty_percent) + 
+                  log(asian_only_percent) + 
+                  log(hispanic_percent) + 
+                  log(white_only_percent) + 
+                  uncommon_make + 
+                  spcl_fuel + 
+                  AWD_4WD + 
+                  single_owner + 
+                  dealer_type +
+          log(poverty_percent)*dealer_type +
+                  has_accidents, 
+    data = used_cars_no_outliers[1:23])
+
+
+summary(intmod_out)
+BIC(intmod_out)
+
+# our model with interaction, with outliers
+bptest(intmod1)
+
+
+
+# our model with interaction, without outliers
+bptest(intmod_out)
+
+plot(intmod1)
+plot(intmod_out)
+
+summ_intmod <- summary(intmod1)      # LM with interaction, for discussion
+summ_intmodout <- summary(intmod_out)   # LM of interaction model without outliers.
+
+```
+
+## Diagnostic summary
+
+```{r confirm_diagnostics, fig.width = 8, fig.height = 10}
+# our model with outliers
+bptest(bestmod2)
+
+# our model without outliers
+bptest(bestmod_out)
+
+par(mfrow=c(4,4))
+plot(lm_full1)
+plot(bestmod1)
+plot(bestmod2)
+plot(bestmod_out)
+```
+
+## Export results
+
+```{r post_analysis_value_figure_extraction, fig.width = 8, fig.height = 3}
+
+fp_output <- "~/GitHub/project-regression/output/"
+
+# confidence intervals
+con_ints <- confint(bestmod2)
+
+# plot showing before and after log transformation on price
+par(mfrow=c(1,2))
+x <- used_cars_ca$price
+xnorm <- seq(min(x), max(x), length = 40)
+ynorm <- dnorm(xnorm, mean = mean(x), sd = sd(x))
+
+hist(x, breaks = 15, xlab = "price", main = "", freq = FALSE)
+
+lines(xnorm, ynorm, col = "red", lwd = 2)
+
+x <- used_cars_ca_log_all$log_price
+xnorm <- seq(min(x), max(x), length = 40)
+ynorm <- dnorm(xnorm, mean = mean(x), sd = sd(x))
+
+hist(x, breaks = 15, xlab = "log(price)", main = "", freq = FALSE)
+
+lines(xnorm, ynorm, col = "red", lwd = 2)
+
+# regression summaries
+summ_full <- summary(lm_full1)
+summ_stepmod <- summary(bestmod1)     # LM output from stepwise function
+summ_bestmod <- summary(bestmod2)     # LM with our adjustments, final model
+summ_bestmodout <- summary(bestmod_out)  # LM of final model without outliers
+
+# AIC AND BIC
+
+col_1  <- AIC(lm_full1, bestmod1, bestmod2, bestmod_out)
+col_2  <- BIC(lm_full1, bestmod1, bestmod2, bestmod_out)
+col_3  <- rbind(summ_full$adj.r.squared, summ_stepmod$adj.r.squared, summ_bestmod$adj.r.squared, summ_bestmodout$adj.r.squared)
+
+fitassess <- cbind(col_1, col_2, col_3)
+fitassess <- fitassess[, -3]
+
+# write.csv(fitassess, paste0(fp_output, "fitassess.csv"))
+
+# table of coefficients
+modelests <- as.data.frame(cbind(coef(bestmod2), coef(bestmod_out), sqrt(diag(vcov(bestmod2))), sqrt(diag(vcov(bestmod_out)))))
+
+colnames(modelests) <- c("Est_All_Obs", "Est_No_Outliers", "SE_All_Obs", "SE_No_Outliers")
+
+modelests <- mutate(modelests, perc_chg_coef = (Est_No_Outliers - Est_All_Obs) / Est_All_Obs, perc_chg_SE = (SE_No_Outliers - SE_All_Obs) / SE_All_Obs )
+
+round_df <- function(x, digits) {
+    # round all numeric variables
+    # x: data frame 
+    # digits: number of digits to round
+    numeric_columns <- sapply(x, mode) == 'numeric'
+    x[numeric_columns] <-  round(x[numeric_columns], digits)
+    x
+}
+
+coefse <- round_df(modelests, 10)
+
+# write.csv(coefse, paste0(fp_output, "coefse.csv"))
+
+
+con_ints <- round_df(con_ints, 10)
+# write.csv(con_ints, paste0(fp_output,"conf_ints.csv"))
+
+# write.csv(outliers, paste0(fp_output,"outliers.csv"))
+# write.csv(outliers_raw, paste0(fp_output,"outliers_raw.csv"))
+
+# sink(paste0(fp_output, "bcox.csv"))
+print(summary(mod_boxcox))
+# sink()
+```
+# Refined presentation plots
+
+```{r presentation_plots}
+### Plot to illustrate EDA on continuous variables
+
+pairs4 <- c("log_price",               
+"age",               
+"mileage",            
+"log_horsepower",         
+"log_best_mpg", 
+"log_cubic_in",
+"log_wheelbase")        
+
+used_pair4 <- dplyr::select(used_cars_ca_transformed, all_of(pairs4))
+
+png(file=paste0(fp_figures, "EDA_selection_cont", ".png"), width = 15, height = 16, unit = "in", res = 225, antialias = "cleartype")
+
+ggplot2::theme_set(ggplot2::theme_bw())
+par(cex=1)
+ggpairs(used_pair4, progress = FALSE) + theme(axis.text.x = element_text(angle = 90, hjust = 1)) + theme(text=element_text(size=20))
+
+dev.off()
+
+### Plot to illustrate EDA on discrete variables
+
+pairs5 <- c("log_price", "body_type", "color", "uncommon_make", "dealer_type", "has_accidents")
+
+used_pair5 <- dplyr::select(used_cars_ca_transformed, all_of(pairs5))
+
+png(file=paste0(fp_figures, "EDA_selection_discrete", ".png"), width = 13, height = 16, unit = "in", res = 225, antialias = "cleartype")
+
+ggplot2::theme_set(ggplot2::theme_bw())
+par(cex=1)
+ggpairs(used_pair5, progress = FALSE) + theme(axis.text.x = element_text(angle = 90, hjust = 1)) + theme(text=element_text(size=20))
+
+dev.off()
+
+### Plot for transformations
+
+fp_figures <- "~/GitHub/project-regression/figures/"
+
+png(file=paste0(fp_figures, "before_after_transformations", ".png"), width = 12, height = 6, unit = "in", res = 225, antialias = "cleartype")
+
+par(mfcol=c(2, 5),
+    mgp = c(2.2, 1,0),
+    mar = c(4, 4, 1.5, 1))  # bot, left, top, right
+
+hist(used_cars_ca$price, breaks = 15, xlab = "price", main = "Before Transformations")
+hist(used_cars_ca_transformed$log_price, breaks = 15, xlab = "log(price)", main = "After Transformations")
+
+for (i in c(2, 3, 7, 8)){
+  plot_pairs_cont(used_cars_ca, colnums = i, yvar = "price", title = "Before Transformations")
+  plot_pairs_cont(used_cars_ca_transformed, colnums = i, yvar = "log_price", title = "After Transformations")}
+
+dev.off()
+
+### Plot for optimal response transformation
+
+par(mfrow = c((length(predictors) -1), n.categories), 
+      mar = c(1, 1, 1.5, 0.1),         # margin total:  Bot, Left, Top, Right 
+      oma = c(2.0, 2.2, 3.0, 0.0),         # mtext area: Bot, Left, Top, Right
+      mgp = c(1.9, 0.3,  0),               # location: axis title, labels, line
+      cex=1.5,                             # scaler
+      tcl = -0.1) 
+
+png(file=paste0(fp_figures, "inverse_response_plot", ".png"), width = 7, height = 5, unit = "in", res = 225, antialias = "cleartype")
+
+inverseResponsePlot(boxcox_fit, lambda=c(-1, 0, 0.5, 1, 2))
+
+title(main = "Inverse Response Plot: Optimal Transformations")
+
+dev.off()
+
+### Plot for variable selection
+
+layout(matrix(c(1,2,2), nrow = 1, ncol = 3, byrow = TRUE))
+
+plot_best_model(number_variables, 'bic', 'min')
+plot(model, scale = "bic", main = "Frequency of Predictors in Best Models: BIC")
+
+#Layout of plots
+LO <- matrix(c(1,2,2,2,2,1,2,2,2,2,2), nrow = 2, ncol = 5, byrow = TRUE)
+
+#Resolution, pointsize
+resol <- 225
+point.size <- 10
+ 
+#Overall units in inches
+widths <- c(2.5,1.5,1.5,1.5,1.5) #widths of each figure in layout (i.e. column widths)
+heights <- c(2,2) #heights of each figure in layout (i.e. row heights)
+ 
+#Outer margins and calculation of full dimensions
+OMA <- c(0,0,0,0)  #Outer margins c(bottom, left, top, right)
+total.height <- sum(heights) + OMA[1]*point.size*1/72 + OMA[3]*point.size*1/72
+total.width <- sum(widths) + OMA[2]*point.size*1/72 + OMA[4]*point.size*1/72
+ 
+
+png(file=paste0(fp_figures, "variable_selection", ".png"), width = total.width, height = total.height, unit = "in", res = resol, antialias = "cleartype")
+
+par(oma=OMA, ps = point.size)
+
+layout(LO, heights = heights, widths = widths)
+
+par(cex=1)
+
+par(mar=c(3,3,1,0),
+    mgp = c(1.5, 0.5, 0))
+
+plot_best_model(number_variables, 'bic', 'min')
+
+par(mar=c(0,0,0,0),
+mgp = c(2.5, 0.5, 0))
+
+plot(model, scale = "bic", las = 0)
+
+title("Frequency of Predictors in Best Models: BIC", line = 1)
+
+dev.off()
+
+### partial regression plots
+
+#Layout of plots
+LO <- matrix(c(1,2,3,4,5,6,7,8,9), nrow = 3, ncol = 3, byrow = TRUE)
+
+#Resolution, pointsize
+resol <- 225
+point.size <- 10
+ 
+#Overall units in inches
+widths <- c(2.5,2.5,2.5) #widths of each figure in layout (i.e. column widths)
+heights <- c(2.5,2.5,2.5) #heights of each figure in layout (i.e. row heights)
+ 
+#Outer margins and calculation of full dimensions
+OMA <- c(0,0,0,0)  #Outer margins c(bottom, left, top, right)
+total.height <- sum(heights) + OMA[1]*point.size*1/72 + OMA[3]*point.size*1/72
+total.width <- sum(widths) + OMA[2]*point.size*1/72 + OMA[4]*point.size*1/72
+ 
+png(file=paste0(fp_figures, "partial_regression_plots", ".png"), width = total.width, height = total.height, unit = "in", res = resol, antialias = "cleartype")
+
+par(oma=OMA, ps = point.size)
+
+layout(LO, heights = heights, widths = widths)
+
+par(cex=1)
+
+par(mar=c(2,1.5,1.5,1),
+    mgp = c(0.5, 0, 0))
+
+# Added variable Plot - "age"
+y <- fit_y_on_x_ca[[1]]$residuals
+x <- fit_x_on_x_ca[[1]]$residuals
+plot(x, y, main = "AV Plot: Age", ylab= "log(Price) | others", xlab = "Age | others", yaxt="n", xaxt="n")
+abline(abfit[[1]], col = "red", lwd = 2)
+
+par(mar=c(2,1.5,1.5,1),
+    mgp = c(0.5, 0, 0))
+
+# Added variable Plot - "Mileage"
+y <- fit_y_on_x_ca[[2]]$residuals
+x <- fit_x_on_x_ca[[2]]$residuals
+plot(x, y, main = "AV Plot: Mileage", ylab= "log(Price) | others", xlab = "Mileage | others", yaxt="n", xaxt="n")
+abline(abfit[[2]], col = "red", lwd = 2)
+
+par(mar=c(2,1.5,1.5,1),
+    mgp = c(0.5, 0, 0))
+
+# Added variable Plot - "Horsepower"
+y <- fit_y_on_x_ca[[4]]$residuals
+x <- fit_x_on_x_ca[[4]]$residuals
+plot(x, y, main = "AV Plot: log(Horsepower)", ylab= "log(Price) | others", xlab = "log(Horsepower) | others", yaxt="n", xaxt="n")
+abline(abfit[[4]], col = "red", lwd = 2)
+
+par(mar=c(2,1.5,1.5,1),
+    mgp = c(0.5, 0, 0))
+
+# Added variable Plot - "cubic in"
+y <- fit_y_on_x_ca[[6]]$residuals
+x <- fit_x_on_x_ca[[6]]$residuals
+plot(x, y, main = "AV Plot: log(Cubic Volume)", ylab= "log(Price) | others", xlab = "log(Cubic Volume) | others", yaxt="n", xaxt="n")
+abline(abfit[[6]], col = "red", lwd = 2)
+
+par(mar=c(2,1.5,1.5,1),
+    mgp = c(0.5, 0, 0))
+
+# Added variable Plot - "wheelbase"
+y <- fit_y_on_x_ca[[7]]$residuals
+x <- fit_x_on_x_ca[[7]]$residuals
+plot(x, y, main = "AV Plot: log(Wheelbase)", ylab= "log(Price) | others", xlab = "log(Wheelbase) | others", yaxt="n", xaxt="n")
+abline(abfit[[7]], col = "red", lwd = 2)
+
+par(mar=c(2,1.5,1.5,1),
+    mgp = c(0.5, 0, 0))
+
+# Added variable Plot - "max seating"
+y <- fit_y_on_x_ca[[8]]$residuals
+x <- fit_x_on_x_ca[[8]]$residuals
+plot(x, y, main = "AV Plot: Max Seating", ylab= "log(Price) | others", xlab = "Max Seating | others", yaxt="n", xaxt="n")
+abline(abfit[[8]], col = "red", lwd = 2)
+
+par(mar=c(2,1.5,1.5,1),
+    mgp = c(0.5, 0, 0))
+
+# Added variable Plot - "poverty percent"
+y <- fit_y_on_x_ca[[10]]$residuals
+x <- fit_x_on_x_ca[[10]]$residuals
+plot(x, y, main = "AV Plot: log(% Poverty)", ylab= "log(Price) | others", xlab = "log(% Poverty) | others", yaxt="n", xaxt="n")
+abline(abfit[[10]], col = "red", lwd = 2)
+
+par(mar=c(2,1.5,1.5,1),
+    mgp = c(0.5, 0, 0))
+
+# Added variable Plot - "black only percent"
+y <- fit_y_on_x_ca[[12]]$residuals
+x <- fit_x_on_x_ca[[12]]$residuals
+plot(x, y, main = "AV Plot: log(% Black Only)", ylab= "log(Price) | others", xlab = "log(% Black Only) | others", yaxt="n", xaxt="n")
+abline(abfit[[12]], col = "red", lwd = 2)
+
+par(mar=c(2,1.5,1.5,1),
+    mgp = c(0.5, 0, 0))
+
+# Added variable Plot - "hispanic only percent"
+y <- fit_y_on_x_ca[[13]]$residuals
+x <- fit_x_on_x_ca[[13]]$residuals
+plot(x, y, main = "AV Plot: log(% Hispanic Only)", ylab= "log(Price) | others", xlab = "log(% Hispanic Only) | others", yaxt="n", xaxt="n")
+abline(abfit[[13]], col = "red", lwd = 2)
+
+dev.off()
+
+```
+
+
