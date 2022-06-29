@@ -1,5 +1,5 @@
 ## Primary project objective
-- Investigate the primary factors influencing used vehicle prices via multiple linear regression analysis. Optimal transformations of dependent and indepenant variables and stepwise variable selection are also explored.   
+- Investigate the primary factors influencing used vehicle prices via multiple linear regression analysis. Partial regression plots, optimal transformations of dependent and indepenant variables, and stepwise variable selection are also explored.   
 
 ## Primary language
 
