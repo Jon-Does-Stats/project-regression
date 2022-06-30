@@ -10,7 +10,7 @@
 
 <img src="https://raw.githubusercontent.com/Jon-Does-Stats/project-regression/main/figures/EDA_selection_cont.png" width=675>
 
-- (below) bar plots, box plots, and other plots for exploring the relationship between price (response) and selected discrete predictors.  Note that price is already on the log scale, and that many discrete variables have been recoded from their raw form (i.e., body styles and colors aggegated into fewer groups).
+- (below) Bar plots, box plots, and other plots for exploring the relationship between price (response) and selected discrete predictors.  Note that price is already on the log scale, and that many discrete variables have been recoded from their raw form (i.e., body styles and colors aggegated into fewer groups).
 
 <img src="https://raw.githubusercontent.com/Jon-Does-Stats/project-regression/main/figures/EDA_selection_discrete.png" width=675>
 
